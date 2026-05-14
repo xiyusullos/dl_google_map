@@ -6,7 +6,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 ## path 临时生效
 ```cmd
-set Path=%PROFILE%\.local\bin;%Path%
+set Path=%USERPROFILE%\.local\bin;%Path%
 ```
 
 > 注意: 若要永久生效, 请自行修改环境变量
