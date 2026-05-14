@@ -1,0 +1,24 @@
+[project]
+name = "dl-google-map"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp",
+    "pyyaml",
+    "rich",
+]
+
+[[tool.uv.index]]
+name = "USTC"
+url = "https://mirrors.ustc.edu.cn/pypi/web/simple"
+default = true
+
+# [[tool.uv.index]]
+# name = "TUNA"
+# url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[[tool.uv.index]]
+name = "ALIYUN"
+url = "https://mirrors.aliyun.com/pypi/simple/"

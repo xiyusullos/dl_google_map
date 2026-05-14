@@ -1,0 +1,16 @@
+download:
+  output_dir: "./results/google_tiles"
+  concurrency: 500
+  max_retries: 3
+  skip_existing: true
+  chunk_size: 10000          # 👈 新增：生产者每次计算并入库的瓦片数（建议 1000~5000）
+  fetch_batch_size: 1000     # 👈 新增：消费者每次从DB拉取的待下载数（建议 200~1000）
+network:
+#  proxy: null  # 示例: "http://user:pass@127.0.0.1:7890"
+  proxy: "http://192.168.1.166:40000"
+  timeout: 15
+  headers:
+    User-Agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    Referer: "https://www.google.com/maps"
+db:
+  path: "./tiles.db"
