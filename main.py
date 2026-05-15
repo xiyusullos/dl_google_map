@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🌍 谷歌卫星瓦片下载器 (单文件版) - 404永久跳过增强版
-特性: 瞬时总数计算 | 边算边下并行 | 流式分片入库 | 内存 O(1) | 实时 ETA | 404永久过滤
+🌍 谷歌卫星瓦片下载器 (单文件版) - 类型修复 + 超大范围防护版
+特性: 瞬时总数计算 | 边算边下并行 | 流式分片入库 | 内存 O(1) | 实时 ETA | 404永久过滤 | 全球范围防护
 依赖: pip install aiohttp rich pyyaml
 注意: 仅限个人学习/科研使用，遵守 Google Maps 服务条款
 """
@@ -86,13 +86,15 @@ class Config:
     db_path: str
     chunk_size: int
     fetch_batch_size: int
+    max_tiles_warning: int  # ✅ 新增：瓦片数量预警阈值
 
 
 def load_config(path: str = CONFIG_PATH) -> Config:
     defaults = {
         "download": {
             "output_dir": "./google_tiles", "concurrency": 8, "map_type": "s",
-            "max_retries": 3, "skip_existing": True, "chunk_size": 3000, "fetch_batch_size": 400
+            "max_retries": 3, "skip_existing": True, "chunk_size": 3000, "fetch_batch_size": 400,
+            "max_tiles_warning": 10_000_000  # ✅ 默认预警阈值：1000 万
         },
         "network": {
             "proxy": None, "timeout": 15,
@@ -122,15 +124,18 @@ def load_config(path: str = CONFIG_PATH) -> Config:
             headers=user_cfg["network"]["headers"],
             db_path=user_cfg["db"]["path"],
             chunk_size=int(user_cfg["download"]["chunk_size"]),
-            fetch_batch_size=int(user_cfg["download"]["fetch_batch_size"])
+            fetch_batch_size=int(user_cfg["download"]["fetch_batch_size"]),
+            max_tiles_warning=int(user_cfg["download"].get("max_tiles_warning", 10_000_000))
         )
     except FileNotFoundError:
         CONSOLE.print(f"[yellow]⚠️  未找到 {path}，使用默认配置[/yellow]")
         return Config(
             default_output_dir=defaults["download"]["output_dir"],
-            **{k: v for s in defaults.values() for k, v in s.items() if k not in ["output_dir", "chunk_size", "fetch_batch_size"]},
+            **{k: v for s in defaults.values() for k, v in s.items() if
+               k not in ["output_dir", "chunk_size", "fetch_batch_size", "max_tiles_warning"]},
             chunk_size=defaults["download"]["chunk_size"],
-            fetch_batch_size=defaults["download"]["fetch_batch_size"]
+            fetch_batch_size=defaults["download"]["fetch_batch_size"],
+            max_tiles_warning=defaults["download"]["max_tiles_warning"]
         )
     except Exception as e:
         CONSOLE.print(f"[red]❌ 配置加载失败: {e}[/red]")
@@ -139,11 +144,13 @@ def load_config(path: str = CONFIG_PATH) -> Config:
 
 # =========================== 坐标与瓦片计算 ===========================
 def deg2num(lat_deg: float, lon_deg: float, zoom: int) -> Tuple[int, int]:
-    n = 2.0 ** zoom
+    """✅ 修复：确保返回值严格为 int，避免 range() 报错"""
+    n = 1 << zoom  # ✅ 用位运算替代 2.0**zoom，确保整数且更快
     xtile = int(math.floor((lon_deg + 180.0) / 360.0 * n))
     lat_rad = math.radians(lat_deg)
     ytile = int(math.floor((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n))
-    return max(0, min(xtile, n - 1)), max(0, min(ytile, n - 1))
+    # ✅ 显式转为 int，避免 min/max 返回 float
+    return int(max(0, min(xtile, n - 1))), int(max(0, min(ytile, n - 1)))
 
 
 def calc_tile_count(min_lat: float, min_lon: float, max_lat: float, max_lon: float, levels: List[int]) -> int:
@@ -151,7 +158,9 @@ def calc_tile_count(min_lat: float, min_lon: float, max_lat: float, max_lon: flo
     for z in levels:
         x_min, y_max = deg2num(min_lat, min_lon, z)
         x_max, y_min = deg2num(max_lat, max_lon, z)
-        total += (x_max - x_min + 1) * (y_max - y_min + 1)
+        # ✅ 防御：确保范围有效
+        if x_max >= x_min and y_max >= y_min:
+            total += (x_max - x_min + 1) * (y_max - y_min + 1)
     return total
 
 
@@ -161,6 +170,8 @@ def tile_chunk_generator(min_lat: float, min_lon: float, max_lat: float, max_lon
     for z in levels:
         x_min, y_max = deg2num(min_lat, min_lon, z)
         x_max, y_min = deg2num(max_lat, max_lon, z)
+        # ✅ 防御：跳过无效范围
+        if x_max < x_min or y_max < y_min: continue
         for x in range(x_min, x_max + 1):
             for y in range(y_min, y_max + 1):
                 current_chunk.append((z, x, y))
@@ -186,7 +197,6 @@ class DBManager:
     def _init_db(self):
         conn = self._get_conn()
         cursor = conn.cursor()
-        # 状态码说明: 1=未下载, 2=已完成, 3=可重试失败, 4=永久跳过(如404)
         cursor.executescript("""
                              CREATE TABLE IF NOT EXISTS tasks
                              (
@@ -320,7 +330,6 @@ class DBManager:
         task = self.get_task_by_id(task_id)
         if not task: return []
         output_dir = task["output_dir"]
-        # ✅ 仅拉取状态为 1(未下载) 或 3(可重试失败) 的瓦片，404(状态4) 自动过滤
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute("SELECT z, x, y FROM tiles WHERE task_id=? AND status IN (1, 3) LIMIT ?", (task_id, limit))
@@ -347,13 +356,13 @@ class DBManager:
     def update_tile_status(self, task_id: int, z: int, x: int, y: int, status: int, fail_reason: Optional[str] = None):
         conn = self._get_conn()
         cursor = conn.cursor()
-        if status == 2:  # 成功
+        if status == 2:
             cursor.execute("UPDATE tiles SET status=?, updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND z=? AND x=? AND y=?",
                            (status, task_id, z, x, y))
-        elif status == 4:  # ✅ 永久跳过 (如 404)
+        elif status == 4:
             cursor.execute("UPDATE tiles SET status=?, fail_reason=?, updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND z=? AND x=? AND y=?",
                            (status, fail_reason, task_id, z, x, y))
-        elif status == 3:  # 失败 (增加重试计数)
+        elif status == 3:
             cursor.execute(
                 "UPDATE tiles SET status=?, fail_reason=?, retry_count=retry_count+1, updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND z=? AND x=? AND y=?",
                 (status, fail_reason, task_id, z, x, y))
@@ -377,7 +386,7 @@ class DBManager:
             "total": row[0] or 0,
             "success": row[1] or 0,
             "failed": row[2] or 0,
-            "skipped": row[3] or 0  # ✅ 新增 404 统计
+            "skipped": row[3] or 0
         }
 
     def update_task_status(self, task_id: int, status: str):
@@ -429,7 +438,7 @@ Tuple[bool, Optional[str], int]:
 
 # =========================== TUI 主界面 ===========================
 def show_main_menu() -> str:
-    table = Table(title="🌍 谷歌卫星瓦片下载器 v3.3", show_header=False, box=None)
+    table = Table(title="🌍 谷歌卫星瓦片下载器 v3.4", show_header=False, box=None)
     table.add_column("选项", style="cyan")
     table.add_row("[1] 🆕 新建下载任务")
     table.add_row("[2] 📋 管理/恢复历史任务")
@@ -468,7 +477,6 @@ def run_concurrent_download(task_id: int, min_lat: float, min_lon: float, max_la
                             levels: List[int], config: Config, db: DBManager):
     total_tiles = calc_tile_count(min_lat, min_lon, max_lat, max_lon, levels)
     producer_done = asyncio.Event()
-    # ✅ 新增 skipped 计数器
     stats = {"success": 0, "failed": 0, "skipped": 0, "bytes": 0}
     lock = asyncio.Lock()
     url_template = f"https://mt0.google.com/vt/lyrs={config.map_type}&x={{x}}&y={{y}}&z={{z}}"
@@ -520,7 +528,6 @@ def run_concurrent_download(task_id: int, min_lat: float, min_lon: float, max_la
                                     stats["bytes"] += size
                                     await asyncio.to_thread(db.update_tile_status, task_id, z, x, y, 2)
                                 else:
-                                    # ✅ 核心逻辑: 404 标记为永久跳过 (status=4)，不增加重试计数
                                     if "404" in str(err):
                                         stats["skipped"] += 1
                                         await asyncio.to_thread(db.update_tile_status, task_id, z, x, y, 4, err)
@@ -602,7 +609,6 @@ def resume_task_flow(task_id: int, config: Config, db: DBManager):
 
     CONSOLE.print(f"[cyan]📦 发现 {pending} 个待处理瓦片 (总计 {total_tiles})，开始继续...[/cyan]")
 
-    # ✅ 初始化历史统计，确保进度条从正确位置开始
     hist_stats = db.get_task_stats(task_id)
     stats = {"success": hist_stats['success'], "failed": 0, "skipped": hist_stats['skipped'], "bytes": 0}
     lock = asyncio.Lock()
@@ -675,7 +681,6 @@ def resume_task_flow(task_id: int, config: Config, db: DBManager):
         CONSOLE.print("[yellow]⏸️  任务已暂停[/yellow]")
     else:
         final = db.get_task_stats(task_id)
-        # ✅ 判断完成条件时排除 skipped
         if final['success'] + final['skipped'] == final['total'] and final['failed'] == 0:
             db.update_task_status(task_id, "completed")
             CONSOLE.print("[green]🎉 任务完成！[/green]")
@@ -692,7 +697,7 @@ def main():
     config = load_config()
     db = DBManager(config.db_path)
     CONSOLE.print(Panel(
-        f"⚙️  配置已加载\n• 默认输出: {config.default_output_dir}\n• 并发数: {config.concurrency}\n• 入库块: {config.chunk_size} | 拉取批: {config.fetch_batch_size}",
+        f"⚙️  配置已加载\n• 默认输出: {config.default_output_dir}\n• 并发数: {config.concurrency}\n• 入库块: {config.chunk_size} | 拉取批: {config.fetch_batch_size}\n• 瓦片预警阈值: {config.max_tiles_warning:,}",
         title="🔧 初始化完成", border_style="green"))
 
     global STOP_FLAG
@@ -704,6 +709,24 @@ def main():
                 min_lat, min_lon, max_lat, max_lon = parse_kml_bbox(kml_path)
                 total = calc_tile_count(min_lat, min_lon, max_lat, max_lon, levels)
                 CONSOLE.print(f"[green]✅ 解析成功: BBox=[{min_lat},{min_lon},{max_lat},{max_lon}] 级别={levels}[/green]")
+
+                # ✅ 超大范围预警
+                if total > config.max_tiles_warning:
+                    CONSOLE.print(Panel(
+                        f"[red]⚠️  瓦片数量预警[/red]\n"
+                        f"• 预估总数: [bold yellow]{total:,}[/bold yellow]\n"
+                        f"• 预警阈值: {config.max_tiles_warning:,}\n"
+                        f"• 建议操作:\n"
+                        f"  1. 缩小 KML 边界范围\n"
+                        f"  2. 降低下载级别（如只选 10-14 级）\n"
+                        f"  3. 修改 config.yaml 中 max_tiles_warning 值（需谨慎）",
+                        title="🚨 高风险任务",
+                        border_style="red"
+                    ))
+                    if not Confirm.ask("❓ 是否仍要创建此任务？(y/N)", default=False):
+                        CONSOLE.print("[yellow]👋 已取消任务创建[/yellow]")
+                        continue
+
                 CONSOLE.print(f"[cyan]📦 预计瓦片总数: {total:,} → 输出: {output_dir}[/cyan]")
             except Exception as e:
                 CONSOLE.print(f"[red]❌ KML 解析失败: {e}[/red]")
